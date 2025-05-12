@@ -15,7 +15,10 @@ from aiogram.types import (
 )
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # Инициализация бота
@@ -29,7 +32,8 @@ cursor = conn.cursor()
 
 
 def init_db():
-    """Инициализация базы данных."""
+    """Инициализация базы данных с таблицами."""
+    # Таблица пользователей
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -39,6 +43,7 @@ def init_db():
     )
     ''')
 
+    # Таблица категорий
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,6 +52,7 @@ def init_db():
     )
     ''')
 
+    # Таблица рецептов
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS recipes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,13 +61,27 @@ def init_db():
         ingredients TEXT NOT NULL,
         instructions TEXT NOT NULL,
         user_id INTEGER NOT NULL,
+        likes INTEGER DEFAULT 0,
+        dislikes INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (category_id) REFERENCES categories(id),
         FOREIGN KEY (user_id) REFERENCES users(user_id)
     )
     ''')
 
-    # Добавляем базовые категории
+    # Таблица оценок
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS ratings (
+        user_id INTEGER NOT NULL,
+        recipe_id INTEGER NOT NULL,
+        rating INTEGER NOT NULL,  -- 1 like, -1 dislike
+        PRIMARY KEY (user_id, recipe_id),
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (recipe_id) REFERENCES recipes(id)
+    )
+    ''')
+
+    # Базовые категории
     cursor.execute("SELECT COUNT(*) FROM categories")
     if cursor.fetchone()[0] == 0:
         basic_categories = [
@@ -100,14 +120,33 @@ def main_menu_keyboard():
     )
 
 
-def random_recipe_keyboard():
-    """Клавиатура для случайного рецепта."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🎲 Новый случайный рецепт")],
-            [KeyboardButton(text="🏠 На главную")]
-        ],
-        resize_keyboard=True
+def recipe_rating_keyboard(recipe_id):
+    """Клавиатура для оценки рецепта."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👍 Нравится",
+                    callback_data=f"like_{recipe_id}"
+                ),
+                InlineKeyboardButton(
+                    text="👎 Не нравится",
+                    callback_data=f"dislike_{recipe_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎲 Новый случайный",
+                    callback_data="random_recipe"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏠 На главную",
+                    callback_data="main"
+                )
+            ]
+        ]
     )
 
 
@@ -192,28 +231,25 @@ def recipes_keyboard(category_id=None, page=0, per_page=5):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def send_random_recipe(message: types.Message):
-    """Отправляет случайный рецепт."""
-    cursor.execute("SELECT COUNT(*) FROM recipes")
-    count = cursor.fetchone()[0]
-    random_id = random.randint(1, count)
-
+async def send_recipe_with_rating(recipe_id, message: types.Message):
+    """Отправляет рецепт с кнопками оценки."""
     cursor.execute('''
-        SELECT r.title, c.name, r.ingredients, r.instructions, u.full_name
+        SELECT r.title, c.name, r.ingredients, r.instructions, 
+               u.full_name, r.likes, r.dislikes
         FROM recipes r
         JOIN categories c ON r.category_id = c.id
         JOIN users u ON r.user_id = u.user_id
         WHERE r.id = ?
-    ''', (random_id,))
+    ''', (recipe_id,))
 
     recipe = cursor.fetchone()
 
     if recipe:
-        title, category, ingredients, instructions, author = recipe
+        title, category, ingredients, instructions, author, likes, dislikes = recipe
         response = (
-            f"🎲 <b>Случайный рецепт:</b>\n\n"
             f"🍳 <b>{title}</b>\n"
-            f"📌 Категория: {category}\n\n"
+            f"📌 Категория: {category}\n"
+            f"👍 {likes}   👎 {dislikes}\n\n"
             f"🛒 <b>Ингредиенты:</b>\n{ingredients}\n\n"
             f"📝 <b>Инструкции:</b>\n{instructions}\n\n"
             f"👨‍🍳 Автор: {author}"
@@ -221,10 +257,23 @@ async def send_random_recipe(message: types.Message):
         await message.answer(
             response,
             parse_mode="HTML",
-            reply_markup=random_recipe_keyboard()
+            reply_markup=recipe_rating_keyboard(recipe_id)
         )
-    else:
-        await send_random_recipe(message)
+
+
+async def send_random_recipe(message: types.Message):
+    """Отправляет случайный рецепт."""
+    cursor.execute("SELECT COUNT(*) FROM recipes")
+    count = cursor.fetchone()[0]
+    if count == 0:
+        await message.answer(
+            "В базе пока нет рецептов.",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+
+    random_id = random.randint(1, count)
+    await send_recipe_with_rating(random_id, message)
 
 
 @dp.message(Command("start", "help"))
@@ -299,23 +348,14 @@ async def show_all_recipes(message: types.Message):
 @dp.message(lambda message: message.text == "🎲 Случайный рецепт")
 async def random_recipe(message: types.Message):
     """Обработчик случайного рецепта."""
-    cursor.execute("SELECT COUNT(*) FROM recipes")
-    count = cursor.fetchone()[0]
-
-    if count == 0:
-        await message.answer(
-            "В базе пока нет рецептов.",
-            reply_markup=main_menu_keyboard()
-        )
-        return
-
     await send_random_recipe(message)
 
 
-@dp.message(lambda message: message.text == "🎲 Новый случайный рецепт")
-async def new_random_recipe(message: types.Message):
-    """Обработчик для нового случайного рецепта."""
-    await send_random_recipe(message)
+@dp.callback_query(lambda c: c.data == "random_recipe")
+async def new_random_recipe_callback(callback: types.CallbackQuery):
+    """Обработчик кнопки нового случайного рецепта."""
+    await callback.message.delete()
+    await send_random_recipe(callback.message)
 
 
 @dp.callback_query(lambda c: c.data.startswith(("rec_", "prev_", "next_")))
@@ -323,32 +363,7 @@ async def handle_recipes_pagination(callback: types.CallbackQuery):
     """Обработчик пагинации рецептов."""
     if callback.data.startswith("rec_"):
         recipe_id = int(callback.data.split("_")[1])
-
-        cursor.execute('''
-            SELECT r.title, c.name, r.ingredients, r.instructions, u.full_name
-            FROM recipes r
-            JOIN categories c ON r.category_id = c.id
-            JOIN users u ON r.user_id = u.user_id
-            WHERE r.id = ?
-        ''', (recipe_id,))
-        recipe = cursor.fetchone()
-
-        if recipe:
-            title, category, ingredients, instructions, author = recipe
-            response = (
-                f"🍳 <b>{title}</b>\n"
-                f"📌 Категория: {category}\n\n"
-                f"🛒 <b>Ингредиенты:</b>\n{ingredients}\n\n"
-                f"📝 <b>Инструкции:</b>\n{instructions}\n\n"
-                f"👨‍🍳 Автор: {author}"
-            )
-            await callback.message.answer(
-                response,
-                parse_mode="HTML",
-                reply_markup=home_keyboard()
-            )
-        else:
-            await callback.message.answer("Рецепт не найден")
+        await send_recipe_with_rating(recipe_id, callback.message)
     else:
         action, page, category_id = callback.data.split("_")
         page = int(page)
@@ -373,6 +388,78 @@ async def handle_recipes_pagination(callback: types.CallbackQuery):
             )
 
     await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith(("like_", "dislike_")))
+async def rate_recipe(callback: types.CallbackQuery):
+    """Обработчик оценки рецепта."""
+    action, recipe_id = callback.data.split("_")
+    recipe_id = int(recipe_id)
+    user_id = callback.from_user.id
+
+    # Определяем тип оценки
+    rating = 1 if action == "like" else -1
+
+    # Проверяем, оценивал ли пользователь этот рецепт ранее
+    cursor.execute(
+        "SELECT rating FROM ratings WHERE user_id = ? AND recipe_id = ?",
+        (user_id, recipe_id)
+    )
+    existing_rating = cursor.fetchone()
+
+    try:
+        if existing_rating:
+            old_rating = existing_rating[0]
+            if old_rating == rating:
+                # Пользователь повторно нажал ту же кнопку - отменяем оценку
+                cursor.execute(
+                    "DELETE FROM ratings WHERE user_id = ? AND recipe_id = ?",
+                    (user_id, recipe_id)
+                )
+                update_field = "likes" if rating == 1 else "dislikes"
+                cursor.execute(
+                    f"UPDATE recipes SET {update_field} = {update_field} - 1 WHERE id = ?",
+                    (recipe_id,)
+                )
+                message = "Оценка удалена"
+            else:
+                # Пользователь изменил оценку
+                cursor.execute(
+                    "UPDATE ratings SET rating = ? WHERE user_id = ? AND recipe_id = ?",
+                    (rating, user_id, recipe_id)
+                )
+                # Уменьшаем старую оценку и увеличиваем новую
+                old_field = "likes" if old_rating == 1 else "dislikes"
+                new_field = "likes" if rating == 1 else "dislikes"
+                cursor.execute(
+                    f"UPDATE recipes SET {old_field} = {old_field} - 1, "
+                    f"{new_field} = {new_field} + 1 WHERE id = ?",
+                    (recipe_id,)
+                )
+                message = "Оценка изменена"
+        else:
+            # Новая оценка
+            cursor.execute(
+                "INSERT INTO ratings (user_id, recipe_id, rating) VALUES (?, ?, ?)",
+                (user_id, recipe_id, rating)
+            )
+            update_field = "likes" if rating == 1 else "dislikes"
+            cursor.execute(
+                f"UPDATE recipes SET {update_field} = {update_field} + 1 WHERE id = ?",
+                (recipe_id,)
+            )
+            message = "Спасибо за оценку!"
+
+        conn.commit()
+        await callback.answer(message)
+
+        # Обновляем сообщение с рецептом
+        await callback.message.delete()
+        await send_recipe_with_rating(recipe_id, callback.message)
+
+    except Exception as e:
+        logger.error(f"Ошибка при оценке рецепта: {e}")
+        await callback.answer("Произошла ошибка, попробуйте позже")
 
 
 @dp.message(lambda message: message.text == "➕ Добавить рецепт")
