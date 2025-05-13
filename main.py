@@ -462,17 +462,6 @@ async def rate_recipe(callback: types.CallbackQuery):
         await callback.answer("Произошла ошибка, попробуйте позже")
 
 
-@dp.message(lambda message: message.text == "➕ Добавить рецепт")
-async def start_adding_recipe(message: types.Message, state: FSMContext):
-    """Начинает процесс добавления рецепта."""
-    await message.answer(
-        "Давайте добавим новый рецепт!\n"
-        "Выберите категорию из списка или введите новую:",
-        reply_markup=categories_keyboard()
-    )
-    await state.set_state(RecipeStates.select_category)
-
-
 @dp.message(lambda message: message.text == "❌ Отмена")
 async def cancel_adding(message: types.Message, state: FSMContext):
     """Отменяет добавление рецепта."""
@@ -483,6 +472,16 @@ async def cancel_adding(message: types.Message, state: FSMContext):
     )
 
 
+@dp.message(lambda message: message.text == "➕ Добавить рецепт")
+async def start_adding_recipe(message: types.Message, state: FSMContext):
+    """Начинает процесс добавления рецепта."""
+    await message.answer(
+        "Давайте добавим новый рецепт!\n"
+        "Введите название категории для вашего рецепта:",
+    )
+    await state.set_state(RecipeStates.select_category)
+
+
 @dp.callback_query(RecipeStates.select_category, lambda c: c.data.startswith("cat_"))
 async def select_existing_category(callback: types.CallbackQuery, state: FSMContext):
     """Выбор существующей категории."""
@@ -490,7 +489,7 @@ async def select_existing_category(callback: types.CallbackQuery, state: FSMCont
     cursor.execute("SELECT name FROM categories WHERE id = ?", (category_id,))
     category_name = cursor.fetchone()[0]
 
-    await state.update_data(category_id=category_id, category_name=category_name)
+    await state.update_data(category_id=category_id)
     await callback.message.answer(
         f"Выбрана категория: {category_name}\n"
         "Теперь введите название рецепта:",
@@ -509,22 +508,36 @@ async def enter_new_category(message: types.Message, state: FSMContext):
 
     category_name = message.text.strip()
 
-    cursor.execute(
-        "INSERT OR IGNORE INTO categories (name) VALUES (?)",
-        (category_name,)
-    )
-    conn.commit()
+    if len(category_name) > 50:
+        await message.answer(
+            "Название категории слишком длинное (максимум 50 символов). Попробуйте снова:",
+            reply_markup=cancel_keyboard()
+        )
+        return
 
-    cursor.execute("SELECT id FROM categories WHERE name = ?", (category_name,))
-    category_id = cursor.fetchone()[0]
+    try:
+        cursor.execute(
+            "INSERT OR IGNORE INTO categories (name) VALUES (?)",
+            (category_name,)
+        )
+        conn.commit()
 
-    await state.update_data(category_id=category_id, category_name=category_name)
-    await message.answer(
-        f"Создана новая категория: {category_name}\n"
-        "Теперь введите название рецепта:",
-        reply_markup=cancel_keyboard()
-    )
-    await state.set_state(RecipeStates.enter_title)
+        cursor.execute("SELECT id FROM categories WHERE name = ?", (category_name,))
+        category_id = cursor.fetchone()[0]
+
+        await state.update_data(category_id=category_id)
+        await message.answer(
+            f"Создана категория: {category_name}\n"
+            "Теперь введите название рецепта:",
+            reply_markup=cancel_keyboard()
+        )
+        await state.set_state(RecipeStates.enter_title)
+    except Exception as e:
+        logger.error(f"Ошибка при создании категории: {e}")
+        await message.answer(
+            "Произошла ошибка. Попробуйте выбрать категорию снова:",
+            reply_markup=categories_keyboard()
+        )
 
 
 @dp.message(RecipeStates.enter_title)
@@ -534,9 +547,30 @@ async def enter_recipe_title(message: types.Message, state: FSMContext):
         await cancel_adding(message, state)
         return
 
-    await state.update_data(title=message.text)
+    title = message.text.strip()
+
+    if len(title) > 100:
+        await message.answer(
+            "Название слишком длинное (максимум 100 символов). Введите снова:",
+            reply_markup=cancel_keyboard()
+        )
+        return
+
+    user_id = message.from_user.id
+    cursor.execute(
+        "SELECT id FROM recipes WHERE title = ? AND user_id = ?",
+        (title, user_id)
+    )
+    if cursor.fetchone():
+        await message.answer(
+            "У вас уже есть рецепт с таким названием. Введите другое название:",
+            reply_markup=cancel_keyboard()
+        )
+        return
+
+    await state.update_data(title=title)
     await message.answer(
-        "Отлично! Теперь введите ингредиенты (каждый с новой строки):",
+        "Теперь введите ингредиенты (каждый с новой строки):",
         reply_markup=cancel_keyboard()
     )
     await state.set_state(RecipeStates.enter_ingredients)
@@ -549,9 +583,10 @@ async def enter_recipe_ingredients(message: types.Message, state: FSMContext):
         await cancel_adding(message, state)
         return
 
-    await state.update_data(ingredients=message.text)
+    ingredients = message.text.strip()
+    await state.update_data(ingredients=ingredients)
     await message.answer(
-        "Хорошо! Теперь введите пошаговую инструкцию приготовления:",
+        "Теперь введите инструкцию приготовления:",
         reply_markup=cancel_keyboard()
     )
     await state.set_state(RecipeStates.enter_instructions)
@@ -567,38 +602,33 @@ async def enter_recipe_instructions(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
     user_id = message.from_user.id
 
-    cursor.execute(
-        '''INSERT INTO recipes 
-        (title, category_id, ingredients, instructions, user_id)
-        VALUES (?, ?, ?, ?, ?)''',
-        (
-            user_data['title'],
-            user_data['category_id'],
-            user_data['ingredients'],
-            message.text,
-            user_id
+    try:
+        cursor.execute(
+            '''INSERT INTO recipes 
+            (title, category_id, ingredients, instructions, user_id)
+            VALUES (?, ?, ?, ?, ?)''',
+            (
+                user_data['title'],
+                user_data['category_id'],
+                user_data['ingredients'],
+                message.text,
+                user_id
+            )
         )
-    )
-    conn.commit()
+        conn.commit()
 
-    await message.answer(
-        f"✅ Рецепт '{user_data['title']}' успешно добавлен "
-        f"в категорию '{user_data['category_name']}'!",
-        reply_markup=main_menu_keyboard()
-    )
+        await message.answer(
+            f"✅ Рецепт '{user_data['title']}' успешно добавлен!",
+            reply_markup=main_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении рецепта: {e}")
+        await message.answer(
+            "Произошла ошибка при сохранении. Попробуйте добавить рецепт снова.",
+            reply_markup=main_menu_keyboard()
+        )
+
     await state.clear()
-
-
-@dp.message(lambda message: message.text == "🔍 Поиск")
-async def start_search(message: types.Message):
-    """Начинает процесс поиска."""
-    await message.answer(
-        "Введите название рецепта или часть названия для поиска:",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="❌ Отмена")]],
-            resize_keyboard=True
-        )
-    )
 
 
 @dp.message(lambda message: message.text and message.text != "❌ Отмена")
